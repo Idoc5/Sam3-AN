@@ -26,6 +26,8 @@ class SAM3Service:
         self.inference_state = None
         self.video_sessions = {}
         self._image_size = None
+        self._feature_cache = {}  # 特征缓存：{image_path: {'state': inference_state, 'size': image_size}}
+        self._cache_max_size = 10  # 最大缓存数量
 
     def _init_image_model(self):
         """初始化图像分割模型"""
@@ -34,30 +36,100 @@ class SAM3Service:
 
         print("正在加载SAM3图像模型...")
 
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        # 检查CUDA可用性
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"使用设备: {device}")
+
+        # 优化CUDA设置
+        if device == "cuda":
+            if hasattr(torch, "backends"):
+                if hasattr(torch.backends, "cuda"):
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                if hasattr(torch.backends, "cudnn"):
+                    torch.backends.cudnn.allow_tf32 = True
+            # 清空CUDA缓存
+            torch.cuda.empty_cache()
+            print("已启用CUDA加速")
+        else:
+            print("⚠️ CUDA不可用，使用CPU模式（性能较差）")
 
         from sam3 import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
 
         bpe_path = sam3_src / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-        self.image_model = build_sam3_image_model(bpe_path=str(bpe_path))
-        self.image_processor = Sam3Processor(self.image_model)
+        self.image_model = build_sam3_image_model(bpe_path=str(bpe_path), device=device, eval_mode=True)
+        self.image_processor = Sam3Processor(self.image_model, device=device)
+        
+        # 移动模型到正确设备
+        self.image_model = self.image_model.to(device)
 
         print("SAM3图像模型加载完成")
 
-    def _load_image(self, image_path: str):
-        """加载图像"""
-        if self.current_image_path != image_path or self.inference_state is None:
-            print(f"[DEBUG] 加载图像: {image_path}")
-            image = Image.open(image_path)
-            # 处理 EXIF 旋转信息，修复竖屏图像分割偏移问题
-            image = ImageOps.exif_transpose(image)
-            image = image.convert('RGB')
-            self._image_size = image.size
-            self.inference_state = self.image_processor.set_image(image)
+    def _load_image(self, image_path: str, max_size: int = 1024, use_cache: bool = True):
+        """加载并优化图像尺寸，支持特征缓存"""
+        # 检查缓存
+        if use_cache and image_path in self._feature_cache:
+            print(f"[CACHE] 使用缓存特征: {image_path}")
+            cached = self._feature_cache[image_path]
+            self.inference_state = cached['state']
+            self._image_size = cached['size']
+            self._original_size = cached['original_size']
+            self._scale_factor = cached['scale_factor']
             self.current_image_path = image_path
-            print(f"[DEBUG] 图像尺寸: {self._image_size}")
+            return
+
+        print(f"[DEBUG] 加载图像: {image_path}")
+        image = Image.open(image_path)
+        # 处理 EXIF 旋转信息，修复竖屏图像分割偏移问题
+        image = ImageOps.exif_transpose(image)
+        image = image.convert('RGB')
+
+        # 优化图像尺寸（如果过大）
+        width, height = image.size
+        original_size = (width, height)
+        scale_factor = 1.0
+
+        if max(width, height) > max_size:
+            # 保持宽高比缩放
+            if width > height:
+                new_width = max_size
+                new_height = int(height * max_size / width)
+            else:
+                new_height = max_size
+                new_width = int(width * max_size / height)
+
+            scale_factor = width / new_width if width > height else height / new_height
+            print(f"[OPTIMIZE] 缩放图像: {width}x{height} -> {new_width}x{new_height}, 缩放因子: {scale_factor:.4f}")
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        self._image_size = image.size
+        self._original_size = original_size
+        self._scale_factor = scale_factor
+        self.inference_state = self.image_processor.set_image(image)
+        self.current_image_path = image_path
+
+        # 缓存特征
+        if use_cache:
+            self._feature_cache[image_path] = {
+                'state': self.inference_state,
+                'size': self._image_size,
+                'original_size': original_size,
+                'scale_factor': scale_factor
+            }
+            # 限制缓存大小
+            if len(self._feature_cache) > self._cache_max_size:
+                # 移除最旧的缓存（FIFO）
+                oldest_key = next(iter(self._feature_cache))
+                del self._feature_cache[oldest_key]
+                print(f"[CACHE] 移除旧缓存: {oldest_key}")
+
+        print(f"[DEBUG] 图像尺寸: {self._image_size} (原始: {original_size}), 缩放因子: {scale_factor:.4f}")
+    
+    def clear_cache(self):
+        """清空特征缓存"""
+        cache_size = len(self._feature_cache)
+        self._feature_cache.clear()
+        print(f"[CACHE] 已清空缓存，释放了 {cache_size} 个特征")
 
     def _smooth_mask(self, mask: np.ndarray, smooth_level: str) -> np.ndarray:
         """在 mask 级别进行形态学平滑，从根本上消除锯齿
@@ -447,6 +519,15 @@ class SAM3Service:
 
         print(f"[DEBUG] 原始结果: masks={len(masks)}, boxes={len(boxes)}, scores={len(scores)}")
 
+        # 还原负样本框到缩放后的图像尺寸（用于过滤）
+        scale_factor = getattr(self, '_scale_factor', 1.0)
+        negative_boxes_scaled = []
+        if negative_boxes and scale_factor != 1.0:
+            inverse_scale = 1.0 / scale_factor
+            negative_boxes_scaled = [[v * inverse_scale for v in box] for box in negative_boxes]
+        else:
+            negative_boxes_scaled = negative_boxes
+
         filtered_count = 0
         for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
             try:
@@ -454,7 +535,7 @@ class SAM3Service:
                 box_np = box.cpu().numpy().tolist()
 
                 # 使用 mask 级别的负样本过滤
-                if negative_boxes and self._mask_in_negative_region(mask_np, negative_boxes, threshold=0.4):
+                if negative_boxes_scaled and self._mask_in_negative_region(mask_np, negative_boxes_scaled, threshold=0.4):
                     print(f"[DEBUG] 结果{i}: score={float(score):.4f} - 被负样本区域过滤")
                     filtered_count += 1
                     continue
@@ -463,18 +544,30 @@ class SAM3Service:
 
                 polygon = self._mask_to_polygon(mask_np)
 
+                # 还原坐标到原始图像尺寸
+                if scale_factor != 1.0:
+                    print(f"[DEBUG] 还原坐标，缩放因子: {scale_factor:.4f}")
+                    # 还原 bbox
+                    box_np = [v * scale_factor for v in box_np]
+                    # 还原 polygon
+                    polygon = [[x * scale_factor, y * scale_factor] for x, y in polygon]
+                    # 还原 area
+                    area = float(mask_np.sum() * scale_factor * scale_factor)
+                else:
+                    area = float(mask_np.sum())
+
                 results.append({
                     'id': str(uuid.uuid4())[:8],
                     'label': label,
                     'score': float(score),
                     'bbox': box_np,
                     'polygon': polygon,
-                    'area': float(mask_np.sum()),
+                    'area': area,
                 })
             except Exception as e:
                 print(f"[ERROR] 提取结果{i}失败: {e}")
 
-        if filtered_count > 0:
+        if (filtered_count > 0):
             print(f"[DEBUG] 负样本过滤: 排除了 {filtered_count} 个结果")
 
         return results
@@ -502,13 +595,26 @@ class SAM3Service:
 
                 polygon = self._mask_to_polygon(mask_np)
 
+                # 还原坐标到原始图像尺寸
+                scale_factor = getattr(self, '_scale_factor', 1.0)
+                if scale_factor != 1.0:
+                    print(f"[DEBUG] 还原坐标，缩放因子: {scale_factor:.4f}")
+                    # 还原 bbox
+                    box_np = [v * scale_factor for v in box_np]
+                    # 还原 polygon
+                    polygon = [[x * scale_factor, y * scale_factor] for x, y in polygon]
+                    # 还原 area
+                    area = float(mask_np.sum() * scale_factor * scale_factor)
+                else:
+                    area = float(mask_np.sum())
+
                 results.append({
                     'id': str(uuid.uuid4())[:8],
                     'label': label,
                     'score': float(score),
                     'bbox': box_np,
                     'polygon': polygon,
-                    'area': float(mask_np.sum()),
+                    'area': area,
                 })
             except Exception as e:
                 print(f"[ERROR] 提取结果{i}失败: {e}")
@@ -582,3 +688,97 @@ class SAM3Service:
         self.video_predictor = None
         self.image_model = None
         self.image_processor = None
+    
+    # ==================== 批量处理优化 ====================
+    
+    def batch_segment_by_text(self, image_paths: list, prompt: str, confidence: float = 0.5, 
+                              max_size: int = 1024, use_cache: bool = True):
+        """批量文本分割
+        
+        Args:
+            image_paths: 图像路径列表
+            prompt: 文本提示
+            confidence: 置信度阈值
+            max_size: 最大图像尺寸
+            use_cache: 是否使用特征缓存
+            
+        Returns:
+            dict: {image_path: [分割结果], ...}
+        """
+        results = {}
+        
+        print(f"[BATCH] 开始批量分割，共 {len(image_paths)} 张图像")
+        print(f"[BATCH] 提示词: '{prompt}', 置信度: {confidence}")
+        
+        total_start = time.time()
+        
+        for i, image_path in enumerate(image_paths, 1):
+            try:
+                print(f"\n[BATCH] 处理第 {i}/{len(image_paths)} 张: {image_path}")
+                start_time = time.time()
+                
+                # 使用优化后的分割方法
+                result = self.segment_by_text(image_path, prompt, confidence)
+                seg_time = time.time() - start_time
+                
+                results[image_path] = result
+                print(f"[BATCH] 完成: {seg_time:.2f}秒, 结果数: {len(result)}")
+                
+            except Exception as e:
+                print(f"[ERROR] 批量分割失败 {image_path}: {e}")
+                traceback.print_exc()
+                results[image_path] = []
+        
+        total_time = time.time() - total_start
+        avg_time = total_time / len(image_paths) if image_paths else 0
+        
+        print(f"\n[BATCH] 批量分割完成!")
+        print(f"[BATCH] 总耗时: {total_time:.2f}秒")
+        print(f"[BATCH] 平均每张: {avg_time:.2f}秒")
+        print(f"[BATCH] 处理速度: {len(image_paths)/total_time:.2f} 张/秒")
+        
+        return results
+    
+    def segment_by_text_with_optimization(self, image_path: str, prompt: str, 
+                                         confidence: float = 0.5, max_size: int = 1024):
+        """优化版的文本分割方法，包含所有优化
+        
+        这是对原有 segment_by_text 方法的优化版本，集成了：
+        1. 图像尺寸优化
+        2. 特征缓存
+        3. GPU加速（如果可用）
+        
+        Args:
+            image_path: 图像路径
+            prompt: 文本提示
+            confidence: 置信度阈值
+            max_size: 最大图像尺寸
+            
+        Returns:
+            list: 分割结果列表
+        """
+        try:
+            self._init_image_model()
+            
+            # 使用优化后的图像加载方法
+            self._load_image(image_path, max_size=max_size, use_cache=True)
+            
+            print(f"[OPTIMIZED] 文本分割: prompt='{prompt}', confidence={confidence}")
+            
+            # 设置置信度
+            self.image_processor.confidence_threshold = confidence
+            
+            # 执行文本分割
+            output = self.image_processor.set_text_prompt(
+                state=self.inference_state,
+                prompt=prompt
+            )
+            
+            print(f"[OPTIMIZED] 输出keys: {list(output.keys()) if output else 'None'}")
+            
+            return self._extract_results(output, prompt)
+            
+        except Exception as e:
+            print(f"[ERROR] segment_by_text_with_optimization: {e}")
+            traceback.print_exc()
+            return []

@@ -1,0 +1,50 @@
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# 测试文件
+test_*.py
+*.png
+*.jpg
+
+# 模型文件（会在构建时下载）
+sam3.pt
+*.safetensors
+
+# Node modules（如果有）
+node_modules/
+
+# 数据目录
+data/
+uploads/
+exports/

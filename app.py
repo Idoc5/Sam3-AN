@@ -976,4 +976,4 @@ if __name__ == '__main__':
     print("=" * 50)
 
     # 启动Flask服务器（关闭debug模式以避免重复打开浏览器）
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)

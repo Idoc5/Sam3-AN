@@ -1,0 +1,50 @@
+# 优化版Dockerfile - CPU版本
+FROM python:3.10-slim
+
+# 设置工作目录
+WORKDIR /app
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    git-lfs \
+    libopencv-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 升级pip
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# 安装CPU版本的PyTorch
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# 复制requirements文件
+COPY requirements.txt .
+
+# 安装Python依赖
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制项目文件
+COPY . .
+
+# 创建数据目录
+RUN mkdir -p /app/data /app/uploads /app/exports
+
+# 暴露端口
+EXPOSE 5001
+
+# 设置环境变量
+ENV PYTHONUNBUFFERED=1
+ENV DEVICE_TYPE=cpu
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5001/ || exit 1
+
+# 启动脚本 - 下载模型并启动服务
+COPY docker-entrypoint.sh /app/
+RUN chmod +x /app/docker-entrypoint.sh
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

@@ -633,6 +633,9 @@ def build_sam3_image_model(
 
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
+    
+    # 确保所有子模块都在正确的设备上
+    model = model.to(device)
 
     return model
 
