@@ -3,6 +3,7 @@ SAM3模型服务封装 - 修正版
 """
 import os
 import sys
+import time
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
@@ -28,17 +29,77 @@ class SAM3Service:
         self._image_size = None
         self._feature_cache = {}  # 特征缓存：{image_path: {'state': inference_state, 'size': image_size}}
         self._cache_max_size = 10  # 最大缓存数量
+        
+        # 显存管理相关
+        self._current_device = None  # 当前使用的设备 (cuda/cpu)
+        self._gpu_failed_count = 0   # GPU失败计数
+        self._use_cpu_fallback = False  # 是否临时使用CPU
+        self._max_gpu_retries = 3    # GPU最大重试次数
 
-    def _init_image_model(self):
-        """初始化图像分割模型"""
+    def _check_cuda_available(self) -> bool:
+        """检查CUDA是否可用且有足够显存"""
+        if not torch.cuda.is_available():
+            return False
+        
+        try:
+            props = torch.cuda.get_device_properties(0)
+            total_memory = props.total_memory / 1024**3
+            reserved = torch.cuda.memory_reserved(0) / 1024**3
+            free_memory = total_memory - reserved
+            
+            # 需要至少2GB可用显存
+            if free_memory >= 2.0:
+                return True
+            else:
+                print(f"[GPU] 可用显存不足: {free_memory:.2f}GB (需要≥2GB)")
+                return False
+        except Exception as e:
+            print(f"[GPU] 显存检测失败: {e}")
+            return False
+
+    def _clear_gpu_cache(self):
+        """清理GPU缓存"""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            print("[GPU] 已清理GPU缓存")
+
+    def _release_gpu_resources(self):
+        """释放GPU资源"""
         if self.image_model is not None:
+            try:
+                # 将模型移到CPU
+                self.image_model = self.image_model.to('cpu')
+            except:
+                pass
+        self._clear_gpu_cache()
+
+    def _init_image_model(self, force_device: str = None):
+        """初始化图像分割模型
+        
+        Args:
+            force_device: 强制使用的设备 ('cuda' 或 'cpu')，None则自动选择
+        """
+        if self.image_model is not None and force_device is None:
             return
 
         print("正在加载SAM3图像模型...")
 
-        # 检查CUDA可用性
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"使用设备: {device}")
+        # 确定使用的设备
+        if force_device:
+            device = force_device
+        elif self._use_cpu_fallback:
+            # 之前GPU失败过，临时使用CPU
+            device = "cpu"
+            print("[DEVICE] 临时使用CPU模式（上次GPU失败）")
+        elif not self._check_cuda_available():
+            device = "cpu"
+            print("[DEVICE] CUDA不可用或显存不足，使用CPU模式")
+        else:
+            device = "cuda"
+        
+        self._current_device = device
+        print(f"[DEVICE] 使用设备: {device}")
 
         # 优化CUDA设置
         if device == "cuda":
@@ -47,23 +108,66 @@ class SAM3Service:
                     torch.backends.cuda.matmul.allow_tf32 = True
                 if hasattr(torch.backends, "cudnn"):
                     torch.backends.cudnn.allow_tf32 = True
+            # 启用自动混合精度（AMP）
+            self.use_amp = True
+            self.autocast = torch.cuda.amp.autocast(enabled=True)
             # 清空CUDA缓存
             torch.cuda.empty_cache()
-            print("已启用CUDA加速")
+            print("[GPU] 已启用CUDA加速 + 混合精度")
         else:
-            print("⚠️ CUDA不可用，使用CPU模式（性能较差）")
+            self.use_amp = False
+            print("[CPU] 使用CPU模式（性能较差）")
 
         from sam3 import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
+        from config.segmentation_config import SegmentationConfig
 
         bpe_path = sam3_src / "assets" / "bpe_simple_vocab_16e6.txt.gz"
         self.image_model = build_sam3_image_model(bpe_path=str(bpe_path), device=device, eval_mode=True)
-        self.image_processor = Sam3Processor(self.image_model, device=device)
+        self.image_processor = Sam3Processor(
+            self.image_model,
+            device=device,
+            confidence_threshold=SegmentationConfig.DEFAULT_CONFIDENCE,
+            enable_nms=SegmentationConfig.ENABLE_NMS,
+            nms_iou_threshold=SegmentationConfig.NMS_IOU_THRESHOLD,
+        )
         
         # 移动模型到正确设备
         self.image_model = self.image_model.to(device)
 
-        print("SAM3图像模型加载完成")
+        print(f"SAM3图像模型加载完成 (设备: {device})")
+
+    def _handle_oom_error(self, operation_name: str) -> bool:
+        """处理显存不足错误
+        
+        Returns:
+            True 如果可以重试，False 如果应该放弃
+        """
+        self._gpu_failed_count += 1
+        print(f"[OOM] 显存不足 ({operation_name}), 失败次数: {self._gpu_failed_count}/{self._max_gpu_retries}")
+        
+        # 清理GPU缓存
+        self._clear_gpu_cache()
+        
+        if self._gpu_failed_count >= self._max_gpu_retries:
+            # 达到最大重试次数，切换到CPU
+            print(f"[OOM] 重试{self._max_gpu_retries}次后仍失败，切换到CPU模式")
+            self._use_cpu_fallback = True
+            self._gpu_failed_count = 0
+            return False
+        
+        return True  # 可以重试
+
+    def _reset_gpu_state(self):
+        """重置GPU状态（下一个任务重新尝试GPU）"""
+        if self._use_cpu_fallback:
+            print("[GPU] 尝试重新启用GPU模式")
+            self._use_cpu_fallback = False
+            self._gpu_failed_count = 0
+            self._current_device = None
+            # 释放当前模型，下次使用时重新加载到GPU
+            self.image_model = None
+            self.image_processor = None
 
     def _load_image(self, image_path: str, max_size: int = 1024, use_cache: bool = True):
         """加载并优化图像尺寸，支持特征缓存"""
@@ -225,6 +329,39 @@ class SAM3Service:
 
         return result.tolist()
 
+    def _chaikin_smooth(self, points: np.ndarray, iterations: int) -> np.ndarray:
+        """使用 Chaikin 算法平滑多边形
+        
+        Args:
+            points: 多边形点数组 (N, 2)
+            iterations: 迭代次数
+            
+        Returns:
+            平滑后的点数组
+        """
+        if len(points) < 3:
+            return points
+            
+        result = points.copy()
+        for _ in range(iterations):
+            new_points = []
+            n = len(result)
+            
+            for i in range(n):
+                p0 = result[i]
+                p1 = result[(i + 1) % n]
+                
+                # Chaikin 算法: 生成两个新点
+                q = 0.75 * p0 + 0.25 * p1
+                r = 0.25 * p0 + 0.75 * p1
+                
+                new_points.append(q)
+                new_points.append(r)
+            
+            result = np.array(new_points, dtype=np.float64)
+        
+        return result
+
     def smooth_polygon(self, polygon: list, smooth_level: str = 'medium') -> list:
         """对已有多边形进行平滑处理（使用 Chaikin 算法，不会收缩）
 
@@ -259,16 +396,84 @@ class SAM3Service:
 
         return result.tolist()
 
-    def segment_by_text(self, image_path: str, prompt: str, confidence: float = 0.5) -> list:
-        """文本提示分割"""
-        try:
-            self._init_image_model()
-            self._load_image(image_path)
+    def _execute_with_oom_retry(self, operation_func, operation_name: str, *args, **kwargs):
+        """执行操作并在显存不足时自动重试
+        
+        Args:
+            operation_func: 要执行的操作函数
+            operation_name: 操作名称（用于日志）
+            *args, **kwargs: 传递给操作函数的参数
+            
+        Returns:
+            操作结果
+        """
+        max_attempts = self._max_gpu_retries + 1  # GPU重试次数 + 1次CPU
+        
+        for attempt in range(max_attempts):
+            try:
+                # 尝试重置GPU状态（下一个任务重新尝试GPU）
+                if attempt > 0 and self._use_cpu_fallback:
+                    self._init_image_model(force_device='cpu')
+                else:
+                    self._init_image_model()
+                
+                result = operation_func(*args, **kwargs)
+                
+                # 成功后重置GPU状态
+                if not self._use_cpu_fallback:
+                    self._gpu_failed_count = 0
+                
+                return result
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                is_oom = 'out of memory' in error_str or 'cuda out of memory' in error_str
+                
+                if is_oom:
+                    print(f"[OOM] {operation_name} 显存不足 (尝试 {attempt + 1}/{max_attempts})")
+                    
+                    if self._handle_oom_error(operation_name):
+                        # 可以重试，等待并清理
+                        self._clear_gpu_cache()
+                        time.sleep(2)  # 等待2秒
+                        
+                        # 如果之前在GPU上失败，这次尝试CPU
+                        if self._use_cpu_fallback:
+                            print(f"[OOM] 切换到CPU模式重试")
+                            self.image_model = None
+                            self.image_processor = None
+                        continue
+                    else:
+                        # 已切换到CPU，用CPU重试一次
+                        print(f"[OOM] 使用CPU模式重试 {operation_name}")
+                        self.image_model = None
+                        self.image_processor = None
+                        try:
+                            self._init_image_model(force_device='cpu')
+                            return operation_func(*args, **kwargs)
+                        except Exception as cpu_e:
+                            print(f"[ERROR] CPU模式也失败: {cpu_e}")
+                            traceback.print_exc()
+                            return None
+                else:
+                    # 非OOM错误，直接抛出
+                    raise e
+        
+        return None
 
+    def segment_by_text(self, image_path: str, prompt: str, confidence: float = 0.5) -> list:
+        """文本提示分割（支持OOM自动重试）"""
+        # 尝试重置GPU状态
+        self._reset_gpu_state()
+        
+        def _do_segment():
+            self._load_image(image_path)
+            
             print(f"[DEBUG] 文本分割: prompt='{prompt}', confidence={confidence}")
 
             # 设置置信度
             self.image_processor.confidence_threshold = confidence
+            print(f"[DEBUG] 置信度阈值已设置为: {self.image_processor.confidence_threshold}")
 
             # 执行文本分割 - 直接使用 set_text_prompt，它会返回结果
             output = self.image_processor.set_text_prompt(
@@ -277,16 +482,26 @@ class SAM3Service:
             )
 
             print(f"[DEBUG] 输出keys: {list(output.keys()) if output else 'None'}")
+            if output:
+                print(f"[DEBUG] output['masks'] shape: {output['masks'].shape if 'masks' in output else 'N/A'}")
+                print(f"[DEBUG] output['boxes'] shape: {output['boxes'].shape if 'boxes' in output else 'N/A'}")
+                print(f"[DEBUG] output['scores'] shape: {output['scores'].shape if 'scores' in output else 'N/A'}")
+                if 'scores' in output:
+                    scores_np = output['scores'].cpu().numpy()
+                    print(f"[DEBUG] scores values: {scores_np[:10] if len(scores_np) > 0 else 'empty'}")
 
             return self._extract_results(output, prompt)
 
+        try:
+            result = self._execute_with_oom_retry(_do_segment, "文本分割")
+            return result if result else []
         except Exception as e:
             print(f"[ERROR] segment_by_text: {e}")
             traceback.print_exc()
             return []
 
     def segment_by_points(self, image_path: str, points: list) -> list:
-        """点击分割 - 支持正负样本点
+        """点击分割 - 支持正负样本点（支持OOM自动重试）
 
         正样本点：指示要分割的对象位置
         负样本点：指示不想要的区域（用于排除）
@@ -295,8 +510,10 @@ class SAM3Service:
         1. 正样本点转换为小框，用于触发分割
         2. 负样本点转换为小框，用于过滤结果
         """
-        try:
-            self._init_image_model()
+        # 尝试重置GPU状态
+        self._reset_gpu_state()
+        
+        def _do_segment():
             self._load_image(image_path)
 
             # 分离正负样本点
@@ -345,8 +562,11 @@ class SAM3Service:
                 y2 = min(height, y + box_size)
                 boxes.append([x1, y1, x2, y2, 0])  # label=0 负样本
 
-            return self.segment_by_boxes(image_path, boxes)
-
+            return self._segment_by_boxes_internal(image_path, boxes)
+        
+        try:
+            result = self._execute_with_oom_retry(_do_segment, "点击分割")
+            return result if result else []
         except Exception as e:
             print(f"[ERROR] segment_by_points: {e}")
             traceback.print_exc()
@@ -391,8 +611,8 @@ class SAM3Service:
 
         return overlap_ratio > threshold
 
-    def _boxes_overlap(self, box1: list, box2: list, threshold: float = 0.3) -> bool:
-        """检查两个框是否重叠
+    def _compute_iou(self, box1: list, box2: list) -> float:
+        """计算两个框的标准 IoU (Intersection over Union)
         box 格式: [x1, y1, x2, y2]
         """
         x1_1, y1_1, x2_1, y2_1 = box1
@@ -405,18 +625,158 @@ class SAM3Service:
         yi2 = min(y2_1, y2_2)
 
         if xi2 <= xi1 or yi2 <= yi1:
-            return False
+            return 0.0
 
         inter_area = (xi2 - xi1) * (yi2 - yi1)
         box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
         box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union_area = box1_area + box2_area - inter_area
 
+        if union_area <= 0:
+            return 0.0
+
+        return inter_area / union_area
+
+    def _compute_overlap_ratio(self, box1: list, box2: list) -> float:
+        """计算重叠比例（相对于较小框的面积）
+        box 格式: [x1, y1, x2, y2]
+        """
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+
+        # 计算交集
+        xi1 = max(x1_1, x1_2)
+        yi1 = max(y1_1, y1_2)
+        xi2 = min(x2_1, x2_2)
+        yi2 = min(y2_1, y2_2)
+
+        if xi2 <= xi1 or yi2 <= yi1:
+            return 0.0
+
+        inter_area = (xi2 - xi1) * (yi2 - yi1)
+        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
         min_area = min(box1_area, box2_area)
-        if min_area <= 0:
-            return False
 
-        overlap_ratio = inter_area / min_area
-        return overlap_ratio > threshold
+        if min_area <= 0:
+            return 0.0
+
+        return inter_area / min_area
+
+    def _boxes_overlap(self, box1: list, box2: list, threshold: float = 0.3, mode: str = 'iou') -> bool:
+        """检查两个框是否重叠
+        box 格式: [x1, y1, x2, y2]
+        mode: 'iou' - 标准IoU, 'min_ratio' - 相对于小框, 'both' - 两者取最大
+        """
+        if mode == 'iou':
+            iou = self._compute_iou(box1, box2)
+            return iou > threshold
+        elif mode == 'min_ratio':
+            ratio = self._compute_overlap_ratio(box1, box2)
+            return ratio > threshold
+        else:  # 'both'
+            iou = self._compute_iou(box1, box2)
+            ratio = self._compute_overlap_ratio(box1, box2)
+            return max(iou, ratio) > threshold
+
+    def _mask_iou(self, mask1: np.ndarray, mask2: np.ndarray) -> float:
+        """计算两个 mask 的 IoU"""
+        intersection = np.logical_and(mask1, mask2).sum()
+        union = np.logical_or(mask1, mask2).sum()
+        if union == 0:
+            return 0.0
+        return intersection / union
+
+    def _deduplicate_results(self, results: list, iou_threshold: float = 0.4) -> list:
+        """框级别的去重（作为NMS的后备机制）
+        
+        基于 bbox IoU 过滤重叠的检测结果，保留分数更高的
+        """
+        from config.segmentation_config import SegmentationConfig
+        
+        if len(results) <= 1:
+            return results
+        
+        # 获取配置
+        overlap_mode = getattr(SegmentationConfig, 'NMS_OVERLAP_MODE', 'iou')
+        
+        # 按分数降序排序
+        sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
+        
+        kept = []
+        suppressed = set()
+        
+        for i, result_i in enumerate(sorted_results):
+            if i in suppressed:
+                continue
+            
+            kept.append(result_i)
+            
+            # 检查与后续结果的重叠
+            for j in range(i + 1, len(sorted_results)):
+                if j in suppressed:
+                    continue
+                    
+                result_j = sorted_results[j]
+                
+                # 使用配置的重叠模式计算框重叠
+                if self._boxes_overlap(result_i['bbox'], result_j['bbox'], 
+                                       threshold=iou_threshold, mode=overlap_mode):
+                    suppressed.add(j)
+        
+        if len(suppressed) > 0:
+            print(f"[DEDUP] 框级别去重: 过滤了 {len(suppressed)} 个重叠结果")
+        
+        return kept
+
+    def _deduplicate_results_with_mask(self, results: list, output: dict, iou_threshold: float = 0.4) -> list:
+        """Mask 级别的去重（更精确）
+        
+        基于 mask IoU 过滤重叠的检测结果，保留分数更高的
+        """
+        if len(results) <= 1:
+            return results
+        
+        masks = output.get('masks', [])
+        if len(masks) != len(results):
+            print("[DEDUP] mask数量与结果数量不匹配，回退到框级别去重")
+            return self._deduplicate_results(results, iou_threshold)
+        
+        # 预处理所有 mask
+        mask_list = []
+        for mask in masks:
+            mask_np = mask[0].cpu().numpy() if mask.dim() == 3 else mask.cpu().numpy()
+            mask_list.append(mask_np > 0.5)
+        
+        # 按分数降序排序（同时保持索引对应）
+        indexed_results = list(enumerate(results))
+        sorted_results = sorted(indexed_results, key=lambda x: x[1]['score'], reverse=True)
+        
+        kept = []
+        suppressed = set()
+        
+        for orig_i, result_i in sorted_results:
+            if orig_i in suppressed:
+                continue
+            
+            kept.append(result_i)
+            mask_i = mask_list[orig_i]
+            
+            # 检查与后续结果的 mask 重叠
+            for orig_j, result_j in sorted_results:
+                if orig_j == orig_i or orig_j in suppressed:
+                    continue
+                
+                mask_j = mask_list[orig_j]
+                mask_iou = self._mask_iou(mask_i, mask_j)
+                
+                if mask_iou > iou_threshold:
+                    suppressed.add(orig_j)
+        
+        if len(suppressed) > 0:
+            print(f"[DEDUP] Mask级别去重: 过滤了 {len(suppressed)} 个重叠结果")
+        
+        return kept
 
     def segment_by_boxes(self, image_path: str, boxes: list) -> list:
         """框选分割 - 支持正负样本
@@ -500,6 +860,102 @@ class SAM3Service:
 
             return results
 
+        except Exception as e:
+            print(f"[ERROR] segment_by_boxes: {e}")
+            traceback.print_exc()
+            return []
+
+    def _segment_by_boxes_internal(self, image_path: str, boxes: list) -> list:
+        """框选分割的内部实现（不含OOM重试逻辑）"""
+        self._load_image(image_path)
+
+        # 分离正样本框和负样本框（原始像素坐标）
+        positive_boxes_px = []
+        negative_boxes_px = []
+
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = box[:4]
+            label = box[4] if len(box) > 4 else 1
+            is_positive = bool(label)
+
+            label_str = "正样本(+)" if is_positive else "负样本(-)"
+            print(f"[DEBUG] 框{i}: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}] {label_str}")
+
+            if is_positive:
+                positive_boxes_px.append([x1, y1, x2, y2])
+            else:
+                negative_boxes_px.append([x1, y1, x2, y2])
+
+        print(f"[DEBUG] 正样本框: {len(positive_boxes_px)}, 负样本框: {len(negative_boxes_px)}")
+
+        # 如果没有正样本框，无法分割
+        if not positive_boxes_px:
+            print("[DEBUG] 没有正样本框，无法分割")
+            return []
+
+        # 重置 geometric_prompt
+        if "geometric_prompt" in self.inference_state:
+            del self.inference_state["geometric_prompt"]
+        print("[DEBUG] 已重置 geometric_prompt")
+
+        width, height = self._image_size
+        output = None
+
+        # 先添加所有正样本框
+        for i, box in enumerate(positive_boxes_px):
+            x1, y1, x2, y2 = box
+            cx = (x1 + x2) / 2 / width
+            cy = (y1 + y2) / 2 / height
+            w = (x2 - x1) / width
+            h = (y2 - y1) / height
+            norm_box = [cx, cy, w, h]
+            print(f"[DEBUG] 添加正样本框{i}: {norm_box}")
+            output = self.image_processor.add_geometric_prompt(
+                norm_box, True, self.inference_state
+            )
+
+        # 再添加所有负样本框（SAM3 原生支持）
+        for i, box in enumerate(negative_boxes_px):
+            x1, y1, x2, y2 = box
+            cx = (x1 + x2) / 2 / width
+            cy = (y1 + y2) / 2 / height
+            w = (x2 - x1) / width
+            h = (y2 - y1) / height
+            norm_box = [cx, cy, w, h]
+            print(f"[DEBUG] 添加负样本框{i}: {norm_box}")
+            output = self.image_processor.add_geometric_prompt(
+                norm_box, False, self.inference_state
+            )
+
+        if output is None:
+            return []
+
+        print(f"[DEBUG] 输出keys: {list(output.keys()) if output else 'None'}")
+
+        # 提取结果（带 mask 数据用于后处理）
+        results = self._extract_results_with_mask(output, "box_prompt", negative_boxes_px)
+
+        return results
+
+    def segment_by_boxes(self, image_path: str, boxes: list) -> list:
+        """框选分割 - 支持正负样本（支持OOM自动重试）
+
+        正样本框：用于指示要分割的区域
+        负样本框：用于排除不想要的分割结果
+
+        策略：
+        1. 同时将正样本和负样本框传递给 SAM3（利用原生支持）
+        2. 使用 mask 级别的后处理过滤（更精确）
+        """
+        # 尝试重置GPU状态
+        self._reset_gpu_state()
+        
+        try:
+            result = self._execute_with_oom_retry(
+                self._segment_by_boxes_internal, "框选分割", 
+                image_path, boxes
+            )
+            return result if result else []
         except Exception as e:
             print(f"[ERROR] segment_by_boxes: {e}")
             traceback.print_exc()
@@ -618,6 +1074,17 @@ class SAM3Service:
                 })
             except Exception as e:
                 print(f"[ERROR] 提取结果{i}失败: {e}")
+
+        # NMS去重
+        from config.segmentation_config import SegmentationConfig
+        if SegmentationConfig.ENABLE_NMS:
+            if getattr(SegmentationConfig, 'NMS_MASK_LEVEL', False):
+                # 使用更精确的 mask 级别 NMS
+                results = self._deduplicate_results_with_mask(results, output, 
+                                                              iou_threshold=SegmentationConfig.NMS_IOU_THRESHOLD)
+            else:
+                # 使用框级别 NMS
+                results = self._deduplicate_results(results, iou_threshold=SegmentationConfig.NMS_IOU_THRESHOLD)
 
         return results
 

@@ -8,13 +8,15 @@ import torch
 from sam3.model import box_ops
 
 from sam3.model.data_misc import FindStage, interpolate
+from sam3.perflib.nms import nms_masks
 from torchvision.transforms import v2
 
 
 class Sam3Processor:
     """ """
 
-    def __init__(self, model, resolution=1008, device="cuda" if torch.cuda.is_available() else "cpu", confidence_threshold=0.5):
+    def __init__(self, model, resolution=1008, device="cuda" if torch.cuda.is_available() else "cpu", confidence_threshold=0.5,
+                 enable_nms=True, nms_iou_threshold=0.5):
         self.model = model
         self.resolution = resolution
         self.device = device
@@ -27,6 +29,9 @@ class Sam3Processor:
             ]
         )
         self.confidence_threshold = confidence_threshold
+        # NMS配置（解决重复识别问题）
+        self.enable_nms = enable_nms
+        self.nms_iou_threshold = nms_iou_threshold
 
         self.find_stage = FindStage(
             img_ids=torch.tensor([0], device=device, dtype=torch.long),
@@ -195,10 +200,45 @@ class Sam3Processor:
         presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1)
         out_probs = (out_probs * presence_score).squeeze(-1)
 
+        # 记录原始检测数量
+        original_count = out_probs.numel()
+        print(f"[DEBUG-NMS] 原始检测数量: {original_count}, logits shape: {out_logits.shape}, masks shape: {out_masks.shape}")
+
+        # 第一步：置信度过滤
         keep = out_probs > self.confidence_threshold
+        after_confidence_count = keep.sum().item()
+        print(f"[DEBUG-NMS] 置信度过滤: threshold={self.confidence_threshold}, 通过数量: {after_confidence_count}")
+
         out_probs = out_probs[keep]
         out_masks = out_masks[keep]
         out_bbox = out_bbox[keep]
+
+        # 第二步：NMS过滤重复检测（解决同一目标被识别多次的问题）
+        if self.enable_nms and out_probs.numel() > 0:
+            print(f"[DEBUG-NMS] 开始 NMS, 输入 masks shape: {out_masks.shape}")
+            try:
+                nms_keep = nms_masks(
+                    pred_probs=out_probs,
+                    pred_masks=out_masks,
+                    prob_threshold=self.confidence_threshold,
+                    iou_threshold=self.nms_iou_threshold,
+                )
+                nms_suppressed = out_probs.numel() - nms_keep.sum().item()
+                print(f"[DEBUG-NMS] NMS 结果: keep={nms_keep.sum().item()}, suppressed={nms_suppressed}")
+                out_probs = out_probs[nms_keep]
+                out_masks = out_masks[nms_keep]
+                out_bbox = out_bbox[nms_keep]
+
+                # 打印NMS效果日志
+                if nms_suppressed > 0:
+                    print(f"[NMS] 原始检测: {original_count} -> 置信度过滤后: {after_confidence_count} -> NMS过滤后: {out_probs.numel()} (抑制了{nms_suppressed}个重复)")
+            except Exception as e:
+                print(f"[ERROR-NMS] NMS 执行失败: {e}")
+                import traceback
+                traceback.print_exc()
+                # NMS 失败时继续使用置信度过滤后的结果
+
+        print(f"[DEBUG-NMS] 最终结果数量: {out_probs.numel()}")
 
         # convert to [x0, y0, x1, y1] format
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)

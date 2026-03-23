@@ -59,6 +59,31 @@
                     <input type="text" class="form-control form-control-sm"
                            placeholder="搜索图片..." id="imageSearch">
                 </div>
+
+                <!-- 低置信度筛选 -->
+                <div class="filter-section">
+                    <div class="filter-header">
+                        <small class="text-muted"><i class="bi bi-funnel"></i> 低置信度筛选</small>
+                    </div>
+                    <div class="filter-controls">
+                        <div class="filter-slider">
+                            <label class="tiny-label mb-0">阈值</label>
+                            <input type="range" class="form-range form-range-sm"
+                                   id="filterConfidenceSlider" min="0" max="100" value="45">
+                            <span id="filterConfidenceValue" class="tiny-text">0.45</span>
+                        </div>
+                        <div class="filter-actions">
+                            <button class="btn btn-xs btn-outline-warning w-100" onclick="filterLowConfidenceImages()"
+                                    title="只显示含有低置信度标注的图片">
+                                <i class="bi bi-filter"></i> 筛选
+                            </button>
+                            <button class="btn btn-xs btn-outline-secondary w-100 mt-1" onclick="clearImageFilter()"
+                                    title="清除筛选，显示所有图片">
+                                <i class="bi bi-x-circle"></i> 清除
+                            </button>
+                        </div>
+                    </div>
+                </div>
                 
                 <div id="imageList" class="image-list">
                     <div class="empty-state">
@@ -168,6 +193,11 @@
                         <button class="btn btn-tool ai-config-btn" id="aiConfigBtn" onclick="showAIConfigModal()" title="AI翻译配置">
                             <i class="bi bi-translate"></i>
                         </button>
+
+                        <!-- NMS配置 -->
+                        <button class="btn btn-tool nms-config-btn" id="nmsConfigBtn" onclick="showNMSConfigModal()" title="NMS配置">
+                            <i class="bi bi-sliders"></i>
+                        </button>
                     </div>
                 </div>
 
@@ -187,6 +217,9 @@
                     </button>
                     
                     <div class="action-buttons">
+                        <button class="btn btn-outline-danger btn-sm" onclick="deleteCurrentImage()" title="删除当前图片">
+                            <i class="bi bi-file-x"></i>
+                        </button>
                         <button class="btn btn-danger btn-sm" onclick="clearCurrentAnnotations()" title="清除当前图片标注">
                             <i class="bi bi-trash"></i>
                         </button>
@@ -204,27 +237,53 @@
                     <i class="bi bi-chevron-double-right"></i>
                 </div>
                 <!-- 类别管理 -->
-                <div class="panel-section">
-                    <h6><i class="bi bi-tags"></i> 类别管理</h6>
-                    <div class="input-group input-group-sm mb-2">
-                        <input type="text" class="form-control" id="newClassName"
-                               placeholder="新类别名称">
-                        <button class="btn btn-outline-primary" onclick="addClass()">
-                            <i class="bi bi-plus-lg"></i>
+                <div class="panel-section panel-section-compact">
+                    <h6 class="panel-title"><i class="bi bi-tags"></i> 类别</h6>
+                    <div class="compact-input-group">
+                        <input type="text" class="form-control form-control-sm" id="newClassName"
+                               placeholder="新类别">
+                        <button class="btn btn-outline-primary btn-sm" onclick="addClass()">
+                            <i class="bi bi-plus"></i>
                         </button>
                     </div>
                     <div id="classList" class="class-list">
                         <!-- 类别列表 -->
                     </div>
+                    
+                    <!-- 类别统计按钮 -->
+                    <button class="btn btn-outline-info btn-sm w-100 mt-1" onclick="showClassStats()" 
+                            title="查看各类别的标注统计信息">
+                        <i class="bi bi-bar-chart"></i> 类别统计
+                    </button>
+                    
+                    <!-- 置信度清理按钮 -->
+                    
+                    <!-- 置信度清理按钮 -->
+                    <div class="mt-2">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <label class="tiny-label mb-0">置信度阈值</label>
+                            <input type="range" class="form-range form-range-sm flex-grow-1" 
+                                   id="clearConfidenceSlider" min="0" max="100" value="45">
+                            <span id="clearConfidenceValue" class="tiny-text">0.45</span>
+                        </div>
+                        <button class="btn btn-outline-danger btn-sm w-100" onclick="clearLowConfidenceAnnotations()" 
+                                title="删除置信度低于指定值的AI自动标注">
+                            <i class="bi bi-x-circle"></i> 清理低置信度标注
+                        </button>
+                    </div>
+                    
+                    <button class="btn btn-outline-warning btn-sm w-100 mt-2" onclick="clearNonManualAnnotations()" title="清理所有AI自动生成的标注，保留手动标注">
+                        <i class="bi bi-eraser"></i> 清理非手动标注
+                    </button>
                 </div>
 
                 <!-- 文本分割（合并单张和批量） -->
-                <div class="panel-section">
-                    <h6><i class="bi bi-cpu"></i> 文本分割</h6>
-                    <div class="input-group input-group-sm mb-2">
-                        <input type="text" class="form-control" id="textPrompt"
+                <div class="panel-section panel-section-compact">
+                    <h6 class="panel-title"><i class="bi bi-cpu"></i> 文本分割</h6>
+                    <div class="compact-input-group mb-2">
+                        <input type="text" class="form-control form-control-sm" id="textPrompt"
                                placeholder="输入提示词 (如: apple, car)">
-                        <button class="btn btn-primary" onclick="segmentByText()" title="分割当前图片">
+                        <button class="btn btn-primary btn-sm" onclick="segmentByText()" title="分割当前图片">
                             <i class="bi bi-play-fill"></i>
                         </button>
                     </div>
@@ -232,28 +291,40 @@
                     <!-- 批量选项折叠区 -->
                     <div class="batch-toggle" onclick="toggleBatchOptions()">
                         <i class="bi bi-chevron-right" id="batchToggleIcon"></i>
-                        <span>批量分割选项</span>
+                        <span>批量选项</span>
                     </div>
                     <div id="batchOptions" class="batch-options" style="display: none;">
-                        <div class="row g-2 mb-2">
-                            <div class="col-6">
-                                <label class="form-label small text-muted mb-1">从第几张</label>
-                                <input type="number" class="form-control form-control-sm"
+                        <div class="batch-grid">
+                            <div class="batch-field">
+                                <label class="tiny-label">起始</label>
+                                <input type="number" class="form-control form-control-xs"
                                        id="batchStart" placeholder="0" min="0" value="0">
                             </div>
-                            <div class="col-6">
-                                <label class="form-label small text-muted mb-1">到第几张</label>
-                                <input type="number" class="form-control form-control-sm"
-                                       id="batchEnd" placeholder="-1=全部" value="-1">
+                            <div class="batch-field">
+                                <label class="tiny-label">结束</label>
+                                <input type="number" class="form-control form-control-xs"
+                                       id="batchEnd" placeholder="-1" value="-1">
                             </div>
                         </div>
-                        <div class="form-check mb-2">
-                            <input class="form-check-input" type="checkbox" id="skipAnnotated" checked>
-                            <label class="form-check-label small" for="skipAnnotated">
-                                跳过已标注的图片
+                        <div class="batch-row">
+                            <label class="form-check-label tiny-label">
+                                <input class="form-check-input form-check-input-sm" type="checkbox" id="skipAnnotated" checked>
+                                跳过已标注
                             </label>
                         </div>
-                        <button class="btn btn-warning btn-sm w-100" onclick="batchSegment()">
+                        <div class="batch-row">
+                            <label class="tiny-label">模式</label>
+                            <select class="form-select form-select-xs" id="batchMode">
+                                <option value="serial">串行</option>
+                                <option value="concurrent" selected>并发</option>
+                            </select>
+                        </div>
+                        <div class="batch-row" id="maxWorkersDiv">
+                            <label class="tiny-label">最大并发</label>
+                            <input type="number" class="form-control form-control-xs"
+                                   id="maxWorkers" placeholder="2" min="1" max="8" value="2">
+                        </div>
+                        <button class="btn btn-warning btn-sm w-100 mt-2" onclick="batchSegment()">
                             <i class="bi bi-lightning-charge"></i> 批量分割
                         </button>
                     </div>
@@ -261,7 +332,7 @@
 
                 <!-- 当前标注列表 -->
                 <div class="panel-section flex-grow-1">
-                    <h6><i class="bi bi-list-check"></i> 当前标注</h6>
+                    <h6 class="panel-title"><i class="bi bi-list-check"></i> 当前标注</h6>
                     <div id="annotationList" class="annotation-list">
                         <!-- 标注列表 -->
                     </div>
@@ -499,6 +570,68 @@
                 <div class="progress-bar" id="loadingProgress" style="width: 0%"></div>
             </div>
             <div class="progress-text" id="loadingProgressText">0%</div>
+        </div>
+    </div>
+
+    <!-- NMS配置模态框 -->
+    <div class="modal fade" id="nmsConfigModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-sliders"></i> NMS配置 (非重叠检测过滤)</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- 启用NMS -->
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="enableNms" checked>
+                        <label class="form-check-label" for="enableNms">启用NMS</label>
+                        <div class="form-text">过滤重叠的检测结果</div>
+                    </div>
+
+                    <!-- IoU阈值 -->
+                    <div class="mb-3">
+                        <label class="form-label">
+                            IoU阈值: <span id="nmsIouValue">0.40</span>
+                        </label>
+                        <input type="range" class="form-range" id="nmsIouSlider"
+                               min="0" max="100" value="40">
+                        <div class="form-text">值越小过滤越严格 (建议0.3-0.5)</div>
+                    </div>
+
+                    <!-- 重叠模式 -->
+                    <div class="mb-3">
+                        <label class="form-label">重叠计算模式</label>
+                        <select class="form-select" id="nmsOverlapMode">
+                            <option value="iou">标准IoU</option>
+                            <option value="min_ratio">相对小框</option>
+                            <option value="both">两者取最大</option>
+                        </select>
+                        <div class="form-text">计算重叠面积的方式</div>
+                    </div>
+
+                    <!-- 最小面积比例 -->
+                    <div class="mb-3">
+                        <label class="form-label">
+                            最小面积比例: <span id="nmsMinAreaValue">0.10</span>
+                        </label>
+                        <input type="range" class="form-range" id="nmsMinAreaSlider"
+                               min="0" max="100" value="10">
+                        <div class="form-text">过滤太小的检测结果 (相对于图像面积)</div>
+                    </div>
+
+                    <!-- Mask级别NMS -->
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="nmsMaskLevel" checked>
+                        <label class="form-check-label" for="nmsMaskLevel">Mask级别NMS</label>
+                        <div class="form-text">更精确但更慢 (基于mask而非box)</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" onclick="saveNMSConfig()">保存配置</button>
+                </div>
+            </div>
         </div>
     </div>
 

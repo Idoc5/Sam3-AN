@@ -94,7 +94,14 @@ def nms_triton(
     Returns:
         Tensor: Indices of kept boxes, sorted by decreasing score.
     """
+    import numpy as np
+    
     assert scores.dim() == 1, "Scores must be 1D"
+    
+    # Handle empty case
+    if scores.numel() == 0:
+        return torch.tensor([], dtype=torch.int64, device=scores.device)
+    
     iou_mask = ious > iou_threshold
     assert iou_mask.dim() == 2
     assert iou_mask.shape[0] == iou_mask.shape[1] == scores.shape[0]
@@ -102,6 +109,24 @@ def nms_triton(
     assert iou_mask.dtype == torch.bool
 
     num_boxes = scores.size(0)
+    
+    # For small number of boxes, use CPU implementation to avoid triton overhead
+    if num_boxes <= 32:
+        # Simple CPU fallback for small cases
+        scores_np = scores.cpu().numpy()
+        iou_mask_np = iou_mask.cpu().numpy()
+        order = scores_np.argsort()[::-1]
+        keep = []
+        suppressed = set()
+        for i in order:
+            if i in suppressed:
+                continue
+            keep.append(i)
+            for j in order:
+                if j != i and j not in suppressed and iou_mask_np[i, j]:
+                    suppressed.add(j)
+        return torch.tensor(keep, dtype=torch.int64, device=scores.device)
+    
     keep_mask = torch.ones(len(scores), device=scores.device, dtype=torch.bool)
 
     # Sort boxes by scores in descending order
@@ -110,15 +135,33 @@ def nms_triton(
 
     # For the suppression stage, we need to process sequentially, but we'll still take
     # advantage of parallelism by processing in blocks in one program.
-    stage2_grid = (1,)
-    _nms_suppression_kernel[stage2_grid](
-        # Tensors
-        iou_mask_ptr=iou_mask,
-        keep_mask_ptr=keep_mask,
-        # Scalars
-        num_boxes=num_boxes,
-        # Strides
-        iou_mask_stride=iou_mask.stride(0),
-    )
+    try:
+        stage2_grid = (1,)
+        _nms_suppression_kernel[stage2_grid](
+            # Tensors
+            iou_mask_ptr=iou_mask,
+            keep_mask_ptr=keep_mask,
+            # Scalars
+            num_boxes=num_boxes,
+            # Strides
+            iou_mask_stride=iou_mask.stride(0),
+        )
+    except Exception as e:
+        # Fallback to CPU implementation if triton fails
+        print(f"[NMS-TRITON] Triton kernel failed, using CPU fallback: {e}")
+        scores_np = scores.cpu().numpy()
+        iou_mask_np = iou_mask.cpu().numpy()
+        order = scores_np.argsort()[::-1]
+        keep = []
+        suppressed = set()
+        for i in order:
+            if i in suppressed:
+                continue
+            keep.append(i)
+            for j in order:
+                if j != i and j not in suppressed and iou_mask_np[i, j]:
+                    suppressed.add(j)
+        return torch.tensor(keep, dtype=torch.int64, device=scores.device)
+    
     # Extract indices of kept boxes
     return sorted_indices[keep_mask]

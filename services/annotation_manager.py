@@ -126,7 +126,9 @@ class AnnotationManager:
 
     def add_annotations(self, project_id: str, image_index: int,
                         annotations: list, label: str = None):
-        """添加标注（来自SAM3分割结果）"""
+        """添加标注（来自SAM3分割结果）
+        先删除指定类别的非手动标注，再添加新标注
+        """
         with self._lock:
             if project_id not in self.projects:
                 raise ValueError(f"项目不存在: {project_id}")
@@ -137,22 +139,118 @@ class AnnotationManager:
 
             image = project['images'][image_index]
 
+            # 确定目标类别名称
+            target_class = label
+            if annotations and annotations[0].get('class_name'):
+                target_class = annotations[0].get('class_name')
+
+            # 先删除指定类别的非手动标注（保留手动标注和其他类别）
+            if 'annotations' in image and target_class:
+                filtered_annotations = []
+                for ann in image['annotations']:
+                    ann_class = ann.get('class_name') or ann.get('label', '')
+                    ann_manual = ann.get('manual', False)
+
+                    # 保留手动标注，或不同类别的标注
+                    if ann_manual or ann_class != target_class:
+                        filtered_annotations.append(ann)
+                    else:
+                        # 删除该类别的非手动标注
+                        print(f"[JSON] 删除类别 '{target_class}' 的非手动标注")
+
+                image['annotations'] = filtered_annotations
+
+            # 初始化标注数组
+            if 'annotations' not in image:
+                image['annotations'] = []
+
             # 为每个标注添加类别标签
             for ann in annotations:
                 if label:
                     ann['class_name'] = label
                 if 'id' not in ann:
                     ann['id'] = str(uuid.uuid4())[:8]
+                # 批量分割的标注默认为非手动
+                if 'manual' not in ann:
+                    ann['manual'] = False
 
-            # 追加到现有标注
-            if 'annotations' not in image:
-                image['annotations'] = []
+            # 添加新标注
             image['annotations'].extend(annotations)
-            image['annotated'] = True
+            # 更新标注状态：只有当有标注时才标记为已标注
+            image['annotated'] = len(image['annotations']) > 0
 
             project['updated_at'] = datetime.now().isoformat()
             self._save_all_projects()
             self._save_project_annotations(project_id)
+
+    def add_annotations_batch(self, annotations_data: list):
+        """批量添加标注（高性能版本，先删除指定类别的非手动标注）
+
+        Args:
+            annotations_data: [(project_id, image_index, annotations, label), ...]
+        """
+        with self._lock:
+            # 处理每张图片
+            for project_id, image_index, annotations, label in annotations_data:
+                if project_id not in self.projects:
+                    print(f"[JSON] 项目不存在: {project_id}, 跳过")
+                    continue
+
+                project = self.projects[project_id]
+                if image_index >= len(project['images']):
+                    print(f"[JSON] 图片索引越界: {image_index}, 跳过")
+                    continue
+
+                image = project['images'][image_index]
+
+                # 确定目标类别名称
+                target_class = label
+                if annotations and annotations[0].get('class_name'):
+                    target_class = annotations[0].get('class_name')
+
+                # 先删除指定类别的非手动标注（保留手动标注和其他类别）
+                if 'annotations' in image and target_class:
+                    filtered_annotations = []
+                    for ann in image['annotations']:
+                        ann_class = ann.get('class_name') or ann.get('label', '')
+                        ann_manual = ann.get('manual', False)
+
+                        # 保留手动标注，或不同类别的标注
+                        if ann_manual or ann_class != target_class:
+                            filtered_annotations.append(ann)
+                        else:
+                            # 删除该类别的非手动标注
+                            pass
+
+                    image['annotations'] = filtered_annotations
+
+                # 初始化标注数组
+                if 'annotations' not in image:
+                    image['annotations'] = []
+
+                # 为每个标注添加类别标签
+                for ann in annotations:
+                    if label:
+                        ann['class_name'] = label
+                    if 'id' not in ann:
+                        ann['id'] = str(uuid.uuid4())[:8]
+                    # 批量分割的标注默认为非手动
+                    if 'manual' not in ann:
+                        ann['manual'] = False
+
+                # 添加新标注
+                image['annotations'].extend(annotations)
+                # 更新标注状态：只有当有标注时才标记为已标注
+                image['annotated'] = len(image['annotations']) > 0
+
+                project['updated_at'] = datetime.now().isoformat()
+
+            # 保存所有项目
+            self._save_all_projects()
+            # 保存每个项目的标注
+            for project_id, _, _, _ in annotations_data:
+                if project_id in self.projects:
+                    self._save_project_annotations(project_id)
 
     def save_annotations(self, project_id: str, image_index: int, annotations: list):
         """保存标注（覆盖）"""

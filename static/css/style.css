@@ -791,6 +791,15 @@ body {
     flex-shrink: 0; /* 默认不收缩 */
 }
 
+/* 紧凑版面板区域 */
+.panel-section-compact {
+    padding: 12px 14px;
+}
+
+.panel-section-compact .panel-title {
+    margin-bottom: 10px;
+}
+
 /* 当前标注区域 - 可滚动 */
 .panel-section.flex-grow-1 {
     flex: 1;
@@ -884,16 +893,51 @@ body {
     font-family: 'Courier New', monospace;
 }
 
-.class-item .delete-btn {
+.class-item .class-actions {
+    display: flex;
+    gap: 8px;
     opacity: 0;
+    transition: var(--transition);
+}
+
+.class-item:hover .class-actions {
+    opacity: 1;
+}
+
+.class-item .delete-btn {
     cursor: pointer;
+    color: var(--warning);
+    font-size: 12px;
+    transition: var(--transition);
+}
+
+.class-item .delete-btn:hover {
     color: var(--danger);
+    transform: scale(1.2);
+}
+
+.class-item .remove-btn {
+    cursor: pointer;
+    color: var(--text-muted);
     font-size: 14px;
     transition: var(--transition);
 }
 
-.class-item:hover .delete-btn {
-    opacity: 1;
+.class-item .remove-btn:hover {
+    color: var(--danger);
+    transform: scale(1.2);
+}
+
+.class-item .filter-btn {
+    cursor: pointer;
+    color: var(--secondary);
+    font-size: 12px;
+    transition: var(--transition);
+}
+
+.class-item .filter-btn:hover {
+    color: var(--primary);
+    transform: scale(1.2);
 }
 
 /* 标注列表 */
@@ -1597,14 +1641,19 @@ body {
 .batch-toggle {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 0;
+    gap: 6px;
+    padding: 6px 0;
     cursor: pointer;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 11px;
     transition: var(--transition);
-    border-top: 1px solid var(--border-color);
-    margin-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+    margin-top: 6px;
+}
+
+.batch-toggle span {
+    font-weight: 600;
+    letter-spacing: 0.5px;
 }
 
 .batch-toggle:hover {
@@ -1621,8 +1670,150 @@ body {
 }
 
 .batch-options {
-    padding-top: 12px;
+    padding-top: 10px;
     animation: slideDown 0.2s ease;
+}
+
+/* 批量选项网格布局 */
+.batch-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.batch-field {
+    display: flex;
+    flex-direction: column;
+}
+
+.batch-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.batch-row select {
+    flex: 1;
+}
+
+.batch-row input[type="number"] {
+    flex: 1;
+    min-width: 60px;
+}
+
+/* 紧凑输入组 */
+.compact-input-group {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.compact-input-group input {
+    flex: 1;
+}
+
+.compact-input-group .form-control-sm {
+    font-size: 13px;
+    padding: 6px 10px;
+}
+
+.compact-input-group .btn-sm {
+    padding: 6px 10px;
+}
+
+/* 超小标签 */
+.tiny-label {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.6);
+    margin-bottom: 4px;
+    text-transform: none;
+    font-weight: 500;
+}
+
+.tiny-text {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.7);
+    min-width: 35px;
+    text-align: right;
+}
+
+/* 超小表单控件 */
+.form-control-xs {
+    padding: 5px 8px !important;
+    font-size: 12px !important;
+}
+
+.form-select-xs {
+    padding: 5px 24px 5px 8px !important;
+    font-size: 12px !important;
+}
+
+.form-range-sm {
+    height: 20px;
+    padding: 0;
+}
+
+/* 筛选区域 */
+.filter-section {
+    padding: 10px 12px;
+    border-top: 1px solid var(--border-color);
+    margin-top: 8px;
+}
+
+.filter-header {
+    margin-bottom: 8px;
+}
+
+.filter-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.filter-slider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.filter-slider input {
+    flex: 1;
+}
+
+.filter-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+/* 图片项低置信度标记 */
+.image-item.has-low-confidence {
+    border-left: 3px solid var(--warning) !important;
+}
+
+.image-item.has-low-confidence::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--warning), var(--danger));
+}
+}
+
+.form-check-input-sm {
+    width: 14px;
+    height: 14px;
+}
+
+/* 面板标题增强 */
+.panel-title {
+    margin-bottom: 12px;
+    font-size: 10px;
 }
 
 @keyframes slideDown {
